@@ -92,6 +92,12 @@ struct netdev_bsd {
     struct eth_addr etheraddr;
     int mtu;
     int carrier;
+    int get_features_error;
+
+    enum netdev_features current;
+    enum netdev_features advertised;
+    enum netdev_features supported;
+    bool full_duplex;
 
     int tap_fd;         /* TAP character device, if any, otherwise -1. */
 
@@ -106,7 +112,8 @@ enum {
     VALID_ETHERADDR = 1 << 1,
     VALID_IN        = 1 << 2,
     VALID_MTU       = 1 << 3,
-    VALID_CARRIER   = 1 << 4
+    VALID_CARRIER   = 1 << 4,
+    VALID_FEATURES  = 1 << 5,
 };
 
 #define PCAP_SNAPLEN 2048
@@ -1099,6 +1106,75 @@ netdev_bsd_parse_media(int media)
     return supported;
 }
 
+static void
+netdev_bsd_read_features(struct netdev_bsd *netdev)
+{
+    struct ifmediareq ifmr;
+    int *media_list;
+    int error;
+    int i;
+
+    if (netdev->cache_valid & VALID_FEATURES) {
+        return;
+    }
+
+    /* XXX Look into SIOCGIFCAP instead of SIOCGIFMEDIA */
+
+    memset(&ifmr, 0, sizeof(ifmr));
+    ovs_strlcpy(ifmr.ifm_name, netdev_get_name(&netdev->up),
+                sizeof ifmr.ifm_name);
+
+    media_list = xcalloc(ifmr.ifm_count, sizeof(int));
+    ifmr.ifm_ulist = media_list;
+
+    /* We make two SIOCGIFMEDIA ioctl calls.  The first to determine the
+     * number of supported modes, and a second with a buffer to retrieve
+     * them. */
+    error = af_inet_ioctl(SIOCGIFMEDIA, &ifmr);
+    if (error) {
+        VLOG_DBG_RL(&rl, "%s: ioctl(SIOCGIFMEDIA) failed: %s",
+                    netdev_get_name(&netdev->up), ovs_strerror(error));
+        goto cleanup;
+    }
+
+    if (IFM_TYPE(ifmr.ifm_current) != IFM_ETHER) {
+        VLOG_DBG_RL(&rl, "%s: doesn't appear to be ethernet",
+                    netdev_get_name(&netdev->up));
+        error = EINVAL;
+        goto cleanup;
+    }
+
+    error = af_inet_ioctl(SIOCGIFMEDIA, &ifmr);
+    if (error) {
+        VLOG_DBG_RL(&rl, "%s: ioctl(SIOCGIFMEDIA) failed: %s",
+                    netdev_get_name(&netdev->up), ovs_strerror(error));
+        goto cleanup;
+    }
+
+    /* Current settings. */
+    netdev->current = netdev_bsd_parse_media(ifmr.ifm_active);
+    if (!netdev->current) {
+        netdev->current = NETDEV_F_OTHER;
+    }
+    netdev->full_duplex = ifmr.ifm_active & IFM_FDX;
+
+    /* Advertised features. */
+    netdev->advertised = netdev_bsd_parse_media(ifmr.ifm_current);
+
+    /* Supported features. */
+    netdev->supported = 0;
+    for (i = 0; i < ifmr.ifm_count; i++) {
+        netdev->supported |= netdev_bsd_parse_media(ifmr.ifm_ulist[i]);
+    }
+
+    error = 0;
+
+cleanup:
+    free(media_list);
+    netdev->cache_valid |= VALID_FEATURES;
+    netdev->get_features_error = error;
+}
+
 /*
  * Stores the features supported by 'netdev' into each of '*current',
  * '*advertised', '*supported', and '*peer' that are non-null.  Each value is a
@@ -1107,88 +1183,65 @@ netdev_bsd_parse_media(int media)
  * passed-in values are set to 0.
  */
 static int
-netdev_bsd_get_features(const struct netdev *netdev,
+netdev_bsd_get_features(const struct netdev *netdev_,
                         enum netdev_features *current, uint32_t *advertised,
                         enum netdev_features *supported, uint32_t *peer)
 {
-    struct ifmediareq ifmr;
-    int *media_list;
-    int i;
+    struct netdev_bsd *netdev = netdev_bsd_cast(netdev_);
     int error;
 
-
-    /* XXX Look into SIOCGIFCAP instead of SIOCGIFMEDIA */
-
-    memset(&ifmr, 0, sizeof(ifmr));
-    ovs_strlcpy(ifmr.ifm_name, netdev_get_name(netdev), sizeof ifmr.ifm_name);
-
-    /* We make two SIOCGIFMEDIA ioctl calls.  The first to determine the
-     * number of supported modes, and a second with a buffer to retrieve
-     * them. */
-    error = af_inet_ioctl(SIOCGIFMEDIA, &ifmr);
-    if (error) {
-        VLOG_DBG_RL(&rl, "%s: ioctl(SIOCGIFMEDIA) failed: %s",
-                    netdev_get_name(netdev), ovs_strerror(error));
-        return error;
+    ovs_mutex_lock(&netdev->mutex);
+    netdev_bsd_read_features(netdev);
+    if (!netdev->get_features_error) {
+        *current = netdev->current;
+        *advertised = netdev->advertised;
+        *supported = netdev->supported;
+        *peer = 0;
     }
+    error = netdev->get_features_error;
+    ovs_mutex_unlock(&netdev->mutex);
 
-    media_list = xcalloc(ifmr.ifm_count, sizeof(int));
-    ifmr.ifm_ulist = media_list;
-
-    if (IFM_TYPE(ifmr.ifm_current) != IFM_ETHER) {
-        VLOG_DBG_RL(&rl, "%s: doesn't appear to be ethernet",
-                    netdev_get_name(netdev));
-        error = EINVAL;
-        goto cleanup;
-    }
-
-    error = af_inet_ioctl(SIOCGIFMEDIA, &ifmr);
-    if (error) {
-        VLOG_DBG_RL(&rl, "%s: ioctl(SIOCGIFMEDIA) failed: %s",
-                    netdev_get_name(netdev), ovs_strerror(error));
-        goto cleanup;
-    }
-
-    /* Current settings. */
-    *current = netdev_bsd_parse_media(ifmr.ifm_active);
-
-    /* Advertised features. */
-    *advertised = netdev_bsd_parse_media(ifmr.ifm_current);
-
-    /* Supported features. */
-    *supported = 0;
-    for (i = 0; i < ifmr.ifm_count; i++) {
-        *supported |= netdev_bsd_parse_media(ifmr.ifm_ulist[i]);
-    }
-
-    /* Peer advertisements. */
-    *peer = 0;                  /* XXX */
-
-    error = 0;
-cleanup:
-    free(media_list);
     return error;
 }
 
 static int
-netdev_bsd_get_speed(const struct netdev *netdev, uint32_t *current,
+netdev_bsd_get_speed(const struct netdev *netdev_, uint32_t *current,
                      uint32_t *max)
 {
-    enum netdev_features f_current, f_supported, f_advertised, f_peer;
+    struct netdev_bsd *netdev = netdev_bsd_cast(netdev_);
     int error;
 
-    error = netdev_bsd_get_features(netdev, &f_current, &f_advertised,
-                                    &f_supported, &f_peer);
-    if (error) {
-        return error;
+    ovs_mutex_lock(&netdev->mutex);
+    netdev_bsd_read_features(netdev);
+    if (!netdev->get_features_error) {
+        *current =
+            MIN(UINT32_MAX,
+                netdev_features_to_bps(netdev->current, 0) / 1000000ULL);
+        *max =
+            MIN(UINT32_MAX,
+                netdev_features_to_bps(netdev->supported, 0) / 1000000ULL);
     }
+    error = netdev->get_features_error;
+    ovs_mutex_unlock(&netdev->mutex);
 
-    *current = MIN(UINT32_MAX,
-                   netdev_features_to_bps(f_current, 0) / 1000000ULL);
-    *max = MIN(UINT32_MAX,
-               netdev_features_to_bps(f_supported, 0) / 1000000ULL);
+    return error;
+}
 
-    return 0;
+static int
+netdev_bsd_get_duplex(const struct netdev *netdev_, bool *full_duplex)
+{
+    struct netdev_bsd *netdev = netdev_bsd_cast(netdev_);
+    int error;
+
+    ovs_mutex_lock(&netdev->mutex);
+    netdev_bsd_read_features(netdev);
+    if (!netdev->get_features_error) {
+        *full_duplex = netdev->full_duplex;
+    }
+    error = netdev->get_features_error;
+    ovs_mutex_unlock(&netdev->mutex);
+
+    return error;
 }
 
 /*
@@ -1519,6 +1572,7 @@ netdev_bsd_update_flags(struct netdev *netdev_, enum netdev_flags off,
     .get_stats = netdev_bsd_get_stats,               \
     .get_features = netdev_bsd_get_features,         \
     .get_speed = netdev_bsd_get_speed,               \
+    .get_duplex = netdev_bsd_get_duplex,             \
     .set_in4 = netdev_bsd_set_in4,                   \
     .get_addr_list = netdev_bsd_get_addr_list,       \
     .get_next_hop = netdev_bsd_get_next_hop,         \
